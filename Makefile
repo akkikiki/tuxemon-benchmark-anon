@@ -1,0 +1,91 @@
+PY := ./.venv/bin/python
+
+.PHONY: check check-fast lint lint-patched types test slow patch unpatch web serve
+check: lint lint-patched types test slow
+check-fast: lint lint-patched types test
+
+# Applies patches/*.patch to the vendored tuxemon/ clone, in numeric filename
+# order (the shell glob already sorts them), producing the tree every other
+# target in this Makefile assumes exists. Fails fast: a patch that does not
+# apply cleanly stops the loop and the target, rather than silently leaving
+# the tree half-patched.
+patch:
+	cd tuxemon && for p in ../patches/*.patch; do echo "applying $$p"; git apply "$$p" || exit 1; done
+
+# Destroys the applied tree and restores the pristine vendored clone:
+# discards tracked-file edits (git checkout -- .) and removes untracked
+# files the patch series added (git clean -fd) -- e.g. tuxemon/core/clock.py
+# and tuxemon/core/ids.py. The clone's two `git stash` entries are left
+# alone; neither command touches the stash.
+#
+# DESTRUCTIVE: the applied tree is git-ignored by the outer repo, so it is
+# NOT otherwise recoverable once this runs -- patches/*.patch are the sole
+# durable record, and `make patch` must genuinely restore an identical tree
+# from them. This was verified end to end (`make unpatch && make patch &&
+# make check`, tree confirmed byte-identical) before this target shipped;
+# see docs/STATUS.org.
+unpatch:
+	cd tuxemon && git checkout -- . && git clean -fd
+
+lint:
+	$(PY) -m ruff check tuxghost tests scripts
+
+# `mypy` has `follow_imports = "skip"` for `tuxemon.*` and `ruff check`
+# above only scans `tuxghost tests scripts` -- neither ever looks at the
+# vendored engine files our patches actually edit. That hole is real:
+# reverting a patched call site back to `uuid4()` leaves an unused
+# `from tuxemon.core.ids import new_id` import, and nothing catches it.
+# Lint exactly the engine files the currently-applied patches touch,
+# derived from `git -C tuxemon diff`/untracked status rather than a
+# hardcoded list, so this stays correct as patches are added or changed.
+# No mypy gate here on purpose: upstream is unannotated and `--strict`
+# would drown in pre-existing findings that are not ours to fix.
+lint-patched:
+	@files=$$( { git -C tuxemon diff --name-only -- '*.py'; git -C tuxemon ls-files --others --exclude-standard -- '*.py'; } | sort -u ); \
+	if [ -z "$$files" ]; then \
+		echo "lint-patched: no patched .py files found in tuxemon/ -- are the patches applied? (cd tuxemon && for p in ../patches/*.patch; do git apply \$$p; done)"; \
+		exit 1; \
+	fi; \
+	echo "$$files" | sed 's|^|tuxemon/|' | xargs $(PY) -m ruff check
+
+types:
+	$(PY) -m mypy tuxghost tests scripts
+
+test:
+	PYTHONHASHSEED=0 $(PY) -m pytest -q
+
+slow:
+	# exit 5 means "no tests collected", which is correct until Task 6 adds
+	# the first slow test. Any other non-zero status is a real failure.
+	PYTHONHASHSEED=0 TUXGHOST_RUN_SLOW=1 $(PY) -m pytest -q -m slow || [ $$? -eq 5 ]
+
+# Builds build/web/. Run `make serve` to play it.
+web:
+	$(PY) scripts/build_web.py
+
+# Builds and serves the browser build. Override the port with
+# `make serve PORT=9001` if 8777 is taken.
+#
+# A target rather than an instruction to type, for two measured reasons:
+#
+#   * Pyodide REFUSES to run from `file://`, so a server is mandatory, and
+#     the obvious command to put in a doc -- `python -m http.server` -- fails
+#     outright on a machine where only `python3` exists. This one.
+#   * NOT port 8000. Another project on this machine was already serving a
+#     DIFFERENT site there, so browsing to localhost:8000 showed that site and
+#     made this build look broken. A default nobody else is likely to hold
+#     beats a familiar one, and the check below turns a silent wrong-site into
+#     a loud refusal.
+#
+# `$(PY)` is the venv interpreter every other target uses, so this cannot
+# drift from what the rest of the Makefile runs.
+PORT ?= 8777
+serve: web
+	@if lsof -nP -iTCP:$(PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+		echo "refusing: something else is already listening on port $(PORT)."; \
+		echo "serving anyway would show you ITS pages, not this build."; \
+		echo "try: make serve PORT=9001"; \
+		exit 1; \
+	fi
+	@echo "serving build/web on http://localhost:$(PORT)  (ctrl-c to stop)"
+	@cd build/web && ../../$(PY) -m http.server $(PORT)

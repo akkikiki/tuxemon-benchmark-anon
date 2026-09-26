@@ -1,0 +1,482 @@
+"""Headless bootstrap for Tuxemon."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+
+def headless_context() -> Any:
+    """Initialise pygame headlessly and return upstream's DisplayContext.
+
+    Sets both SDL drivers to dummy before importing pygame so no window or
+    audio device is ever opened.
+    """
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ["SDL_AUDIODRIVER"] = "dummy"
+
+    from tuxemon.platform import platform
+
+    platform.init()
+
+    from tuxemon.prepare import headless_init
+
+    return headless_init()
+
+
+def _assert_fps_matches_step_rate(client: Any) -> None:
+    """Refuse to boot a client whose configured frame rate disagrees with
+    this harness's step rate.
+
+    Patch 0005 gives EventAction.run()'s synchronous first update() call
+    `dt = 1.0 / client.config.fps` -- correct in the real (non-headless)
+    game loop, where every later frame's dt comes from that exact same
+    config value (`tuxemon/client.py`: `frame_length = 1.0 /
+    self.config.fps`). This harness's `run_steps` (`tuxghost/loop.py`)
+    does not go through that: it always ticks `client.update(FIXED_DT)`
+    directly, bypassing `config.fps` entirely. So a deferred action's
+    first update() (routed through `config.fps`) and every update() after
+    it (routed through `run_steps`' `FIXED_DT`) only ever see the same dt
+    because the two happen to agree by default -- nothing enforces it.
+    `config.fps` is read from `~/.tuxemon/tuxemon.yaml`'s `display.fps`,
+    outside this repo: on a machine where that file sets a different fps
+    (or 0, which would otherwise surface as a bare ZeroDivisionError deep
+    inside an unrelated action's error handling instead of here), a
+    deferred action would silently see a different dt on its first frame
+    than on every frame after it, and every trace recorded on that
+    machine would silently encode a value nothing in this repo controls.
+    Checked once at boot, not on every `EventAction.run()` call.
+    """
+    from tuxghost.loop import FIXED_DT
+
+    fps = client.config.fps
+    if fps <= 0:
+        raise ValueError(
+            f"client.config.fps={fps!r} must be a positive number of "
+            "frames per second (from ~/.tuxemon/tuxemon.yaml's "
+            "display.fps)."
+        )
+    actual_dt = 1.0 / fps
+    if actual_dt != FIXED_DT:
+        raise ValueError(
+            f"client.config.fps={fps!r} implies a frame duration of "
+            f"{actual_dt!r}s, which does not match this harness's "
+            f"FIXED_DT={FIXED_DT!r}s (tuxghost/loop.py). fps is read "
+            "from ~/.tuxemon/tuxemon.yaml's display.fps, outside this "
+            "repo -- fix that file's fps, or FIXED_DT, so the two agree; "
+            "a mismatch here would silently give deferred EventActions a "
+            "different dt on their first frame than on every frame after "
+            "it, on this machine only."
+        )
+
+
+def resolve_map_asset(current_map: str) -> str | None:
+    """Resolve a save's `npc_state.current_map` to a real map asset path.
+
+    Tries `current_map` as given, then with `.tmx` appended, and accepts
+    whichever candidate resolves to an existing `.tmx` FILE. This is not
+    motivated by any in-repo map content -- measured directly, all 252
+    distinct teleport targets under `tuxemon/mods/tuxemon/maps/` already
+    carry `.tmx` (an earlier version of this docstring claimed otherwise,
+    based on a grep whose character class silently excluded `.` and
+    truncated every name at the dot -- see task 1's fix-round-1 report).
+    It mirrors the engine's OWN loader instead:
+    `tuxemon/map/loader.py`'s `load_map_data` does `Path(path).stem` and
+    then `fetch_asset("maps", f"{name}.tmx")`, i.e. the engine itself
+    boots a bare name exactly as readily as one with the extension
+    already on it. A precondition check stricter than the loader it
+    guards would refuse saves the engine can actually run.
+
+    A candidate only counts as resolved if it is an existing regular
+    FILE with a `.tmx` suffix -- `fetch_asset` itself only tests
+    `Path.exists()` (`tuxemon/constants/asset_loader.py`), so without this
+    a candidate that happens to name an existing directory (e.g. `""`,
+    `"."`, or `"../db"`, which walks back onto a real sibling directory)
+    would resolve to that directory and this function would wrongly
+    return non-`None` for a malformed `current_map` -- letting it past
+    `execute`'s refusal check and crash later, inside `push_state`, as an
+    uncaught exception instead of the exit-2 refusal this function exists
+    to produce.
+
+    Returns `None` when no candidate resolves, so callers can refuse
+    (exit 2) rather than let `fetch_asset`'s bare `OSError` escape as
+    exit 1 ("diverged").
+
+    Callable BEFORE a headless boot, not just after: `execute`'s own
+    precondition check (`tuxghost.execute`) calls this ahead of
+    `boot_from_save`, specifically so a bad `current_map` can be refused
+    (exit 2) without ever booting. `fetch_asset` only searches
+    `_MOD_ASSET_ROOTS`, which -- measured on this tree -- is populated as
+    a module-level side effect of importing `tuxemon.locale.locale`
+    (`fetch_mod_asset_roots(CONFIG)`, run once), itself only reached
+    through a full boot. Called first in a process, before anything has
+    booted, `fetch_asset` would see an always-empty root list and this
+    function would wrongly return `None` for every map, valid ones
+    included -- see `tests/test_boot.py
+    ::test_resolve_map_asset_works_as_the_first_thing_in_a_fresh_process`,
+    which pins this by running it as literally the first statement in a
+    fresh interpreter. `fetch_mod_asset_roots` is idempotent (a
+    `_HAS_POPULATED` guard), so calling it here is a no-op on every call
+    after the first real boot -- this only matters the one time nothing
+    has booted yet.
+    """
+    from tuxemon.constants.asset_loader import fetch_asset, fetch_mod_asset_roots
+    from tuxemon.user_config import CONFIG
+
+    fetch_mod_asset_roots(CONFIG)
+
+    for candidate in (current_map, f"{current_map}.tmx"):
+        try:
+            resolved = fetch_asset("maps", candidate)
+        except OSError:
+            continue
+        resolved_path = Path(resolved)
+        if resolved_path.is_file() and resolved_path.suffix == ".tmx":
+            return str(resolved)
+    return None
+
+
+def build_client(
+    seed: int, clock_epoch: int | None = None, context: Any | None = None
+) -> tuple[Any, Any]:
+    """Build a headless client on a fresh game at the given seed.
+
+    `context`, if given, is used INSTEAD of calling `headless_context()`
+    (the module's own unscaled, `scale=1` context). This exists for two
+    callers: task 9's scale measurement, and `tuxghost.agent.run_agent`'s
+    opt-in `scaled=True`, which boots with `tuxghost.observe
+    .scaled_context()` for human field-of-view (~16x9 tiles, measured,
+    versus the ~80x45-tile view `headless_context()` produces) --
+    `scaled_context()` itself refuses (a loud `RuntimeError`, not a
+    silent degradation) if it is not the first `DisplayContext`-building
+    call in the process, so this is only safe from a fresh process; see
+    its docstring.
+
+    RECORD AND REPLAY MAY USE DIFFERENT CONTEXTS: MEASURED
+    digest-neutral. A 300-step per-step digest sequence
+    (`tuxghost.digest.digest_of`, not just the final digest) was
+    identical at every index between the two contexts, on a schedule
+    that keeps the player moving through the end of the window. This is
+    a measured result, not an architectural guarantee -- one read site
+    is already known (`tuxemon/map/loader.py` reads `context.tile_size`
+    into a loaded map's own `tilewidth`/`tileheight`; grid coordinates
+    stay scale-invariant only because that loader captures the map's
+    NATIVE tile size first, a contingent property of upstream code, not
+    the absence of a read site) -- so today a recording and its replay
+    can safely boot with DIFFERENT contexts (`run_agent(scaled=True)`
+    scaled, `tuxghost.execute` unscaled) without that being a hazard; see
+    `docs/2026-08-26-display-scale-measurement.org` for the raw numbers.
+    This would need re-measuring, not assuming, the day something reads
+    `client.context` into what `tuxghost.digest.state_of` actually
+    digests -- nothing currently does.
+
+    `clock_epoch`, if given, pins the wall clock (`tuxghost.determinism
+    .pin_clock`) and resets the session's own elapsed-time bookkeeping
+    (`local_session.reset_time()`) -- in that order, since `reset_time()`
+    reads the clock to set `_start_timestamp`/`_start_time`
+    (`tuxemon/session.py`). Without this, `AbstractSession.__init__`'s one
+    wall-clock read -- taken once, whenever the module-level
+    `local_session` singleton is first constructed, almost always before
+    any caller has had a chance to call `pin_clock` -- leaks real,
+    unpinned time into `SessionSave.duration`/`total_playtime`/
+    `start_time`. `tuxghost.digest.state_of` never reads `session_state`
+    so this is invisible to `digest_of`, but it IS reachable from a full
+    `SaveData` snapshot -- `tuxghost.record.Recorder` (which digests
+    exactly that) hit it as two different `initial_state_digest`s for the
+    same seed and schedule, recorded twice in one process. Deliberately
+    NOT done unconditionally: constructing a client is not the same
+    action as starting a *recording*, and forcing every caller (most of
+    `tests/`, which don't care about `session_state` at all) through a
+    clock pin would be a surprising side effect for them. `clock_epoch
+    =None` (the default) leaves clock behaviour exactly as before.
+    """
+    import random
+
+    if clock_epoch is not None:
+        from tuxghost.determinism import pin_clock
+
+        pin_clock(clock_epoch)
+
+    if context is None:
+        context = headless_context()
+
+    from tuxemon.core.ids import seed_ids
+    from tuxemon.database.runtime import db
+    from tuxemon.launcher import GameLauncher
+    from tuxemon.main import headless_world
+    from tuxemon.session import local_session
+    from tuxemon.user_config import CONFIG
+
+    # Seed the id factory before anything below can draw from it --
+    # `local_session.reset()` immediately below is one such draw (see its
+    # docstring). Matches the `random.seed(seed)` call further down and
+    # `config.deterministic_seed = seed` next: this build's own `seed`
+    # argument must be authoritative for every entropy source it touches,
+    # not left to whatever `tuxghost.determinism.seed_all` last left on
+    # process-wide state (or never set at all, if a caller never called
+    # it -- e.g. every test in `tests/test_digest.py`, which builds
+    # straight from `build_client` and would otherwise draw ids from raw
+    # OS entropy).
+    seed_ids(seed)
+
+    # `local_session` is a module-level singleton shared across every
+    # `build_client` call in this process. Without resetting it first, a
+    # second build in the same process starts from whatever the previous
+    # build's session already accumulated (its player, its leftover state
+    # stack, ...) instead of a genuinely fresh session -- silent
+    # contamination, not an error. `boot_from_save` already resets for the
+    # same reason; do it here too instead of leaving every caller (tests,
+    # the executor, later tasks) to rediscover the hazard for themselves.
+    local_session.reset()
+
+    # See this function's own docstring: must run AFTER `pin_clock` above
+    # (it reads the clock), so `_start_timestamp`/`_start_time` land on
+    # the pinned epoch rather than whatever real wall-clock reading
+    # `Session.__init__` happened to draw at process start.
+    if clock_epoch is not None:
+        local_session.reset_time()
+
+    # `config.deterministic_seed` is what patch 0002 threads into
+    # `WorldWeatherManager`, the only instance-RNG in the codebase (see
+    # `tuxghost/determinism.py`). It is set here, directly on this build's
+    # own config copy, rather than left to whatever `tuxghost.determinism
+    # .seed_all` last wrote onto the process-wide `CONFIG` singleton:
+    # `CONFIG` persists across every `build_client` call in a process, so a
+    # test (or caller) that never calls `seed_all` would otherwise silently
+    # inherit whichever seed a *previous, unrelated* call happened to leave
+    # behind -- a disagreement between this build's explicit `seed`
+    # argument and its weather RNG. Setting it here makes `build_client`'s
+    # `seed` parameter authoritative for everything it constructs,
+    # matching the `random.seed(seed)` call below.
+    config = CONFIG.copy()
+    config.deterministic_seed = seed
+    client = headless_world(config, context)
+    _assert_fps_matches_step_rate(client)
+
+    random.seed(seed)
+
+    meta = db.mod_metadata.get_mod_metadata("tuxemon")
+    GameLauncher(client).launch(local_session, meta)
+    return client, local_session
+
+
+def snapshot_save(session: Any) -> Any:
+    """Serialise the live session into upstream's SaveData model.
+
+    Strips `screenshot`/`screenshot_width`/`screenshot_height` before
+    returning: `save.get_save_data` renders and base64-encodes a full
+    frame (a 1280x720 RGB buffer, ~99.8% of the resulting payload's
+    size) into `SaveData.screenshot` for upstream's own save-file UI.
+    Nothing in `tuxghost` or `tests` ever reads it -- `initial_state_
+    digest` is computed from the frozen bytes already written into a
+    trace, never by re-rendering, and `tuxghost.digest.state_of` (what
+    `final_digest` is built from) only ever looks at `npc_state`/
+    `world_state`/`persistent_npc_state`. Stripped here, at the one
+    place every caller of this module (`Recorder`, the executor's own
+    round-trip helpers, `tuxghost.cli`'s `record`/`compare`, and every
+    test that calls `snapshot_save` directly) goes through, rather than
+    only excluded from the digest: leaving the bytes in place but
+    unhashed would still require every trace and ad-hoc save this
+    project produces to carry them, buying nothing. `SaveData.
+    screenshot`/`screenshot_width`/`screenshot_height` are all `X |
+    None = Field(default=None)`, so nulling them post-hoc is a clean,
+    supported state of the model -- not a workaround.
+    """
+    from tuxemon.save_system import save
+
+    save_data = save.get_save_data(session)
+    save_data.screenshot = None
+    save_data.screenshot_width = None
+    save_data.screenshot_height = None
+    return save_data
+
+
+def boot_from_save(
+    save_data: Any,
+    seed: int,
+    clock_epoch: int | None = None,
+    context: Any | None = None,
+) -> tuple[Any, Any]:
+    """Boot a headless client and restore `save_data` into it.
+
+    `context`: see the matching parameter on `build_client` -- same
+    behaviour (used instead of `headless_context()` when given) and same
+    measured result: task 9's 300-step digest-sequence measurement found
+    scale digest-neutral, so `tuxghost.execute.execute` (this function's
+    one caller in the executor path) can keep passing no context at all
+    (the module default, unscaled) even though `tuxghost.agent.run_agent
+    (scaled=True)` records with `tuxghost.observe.scaled_context()` -- the
+    mismatch does not perturb `digest_of`. See
+    `docs/2026-08-26-display-scale-measurement.org`.
+
+    `clock_epoch`: see the matching parameter on `build_client` -- same
+    behaviour, same ordering requirement (pin, then `reset_time()`), same
+    reason (`SessionSave.duration`/`total_playtime`/`start_time` leaking
+    real wall-clock time otherwise). This is the executor's path: it calls
+    `boot_from_save` directly and never constructs a
+    `tuxghost.record.Recorder`, so this parameter is what protects it --
+    passing the trace header's `clock_epoch` through gets the same
+    reproducibility guarantee a `Recorder`-driven recording gets, without
+    the executor needing to know why.
+
+    Raises `ValueError` if `save_data.npc_state.current_map` resolves to
+    no map asset (see `resolve_map_asset`). In this repo, that branch is
+    unreachable via `tuxghost.execute.execute`, which already calls
+    `resolve_map_asset` as a precondition and returns exit-2 `Refused`
+    before ever reaching this function -- the branch here exists for
+    callers OUTSIDE that path (anything that calls `boot_from_save`
+    directly on unchecked `save_data`), so such a caller still fails
+    loudly instead of booting onto a silently wrong map.
+
+    The restored player is left genuinely PLAYABLE, not merely present:
+    registered on `client.npc_manager` (so `NPC.update`/`PathController`
+    actually run for it every frame) and movement-unlocked (so a
+    directional input event is not silently dropped by `MovementManager
+    .is_movement_allowed`). Found and fixed by task 3, whose walkability
+    assertion was the first thing in this repo to ever drive the restored
+    player with directional input -- 136 pre-existing tests all read
+    `session.player` state directly instead, which restores correctly
+    regardless of either gap, so neither was ever exercised before.
+
+    Live gameplay reaches both as a SIDE EFFECT of the engine's own event
+    actions: `Teleporter.teleport_character` (`tuxemon/teleporter.py`)
+    calls `npc_manager.place_npc_on_map`, and `TeleportAction.start`
+    (`tuxemon/event/actions/teleport.py`) separately calls
+    `movement_manager.unlock_controls`; upstream's own save-load path
+    (`tuxemon/event/actions/load_game.py`) gets both for free because it
+    re-teleports the player to their own saved position immediately after
+    `session.load_state(save_data)`. `boot_from_save` restores state
+    directly, with no event action ever running, so it does both calls
+    itself instead -- deliberately NOT via `execute_action("teleport",
+    ...)`: every event action goes through `EventEngine`'s deferred queue
+    (patch 0005), so its effects would not be visible until a subsequent
+    `update()`/`run_steps` call, breaking every existing caller that reads
+    `session.player` state immediately after `boot_from_save` returns
+    with no intervening step (e.g. `tests/test_boot.py
+    ::test_boot_from_save_restores_position_and_party`). `add_npc`/
+    `unlock_controls` are plain synchronous calls with no queue, so they
+    take effect before this function returns and touch no field
+    `load_state` already restored.
+
+    Digest-neutral, but not because it "touches no field the digest
+    sees" -- it does: `tuxghost.digest.state_of` reads `npc_manager` via
+    `get_persistent_npc_states` (`tuxghost/digest.py`). It is neutral
+    because that function filters `npc.slug != player_slug`
+    (`tuxemon/npc_manager.py`) -- the player is excluded from what it
+    returns, by slug, not because `NPCManager` itself is unread.
+    """
+    import random
+
+    if clock_epoch is not None:
+        from tuxghost.determinism import pin_clock
+
+        pin_clock(clock_epoch)
+
+    if context is None:
+        context = headless_context()
+
+    from tuxemon.core.ids import seed_ids
+    from tuxemon.entity.npc import NPC
+    from tuxemon.main import headless_world
+    from tuxemon.platform.const.sizes import PLAYER_NPC
+    from tuxemon.session import local_session
+    from tuxemon.user_config import CONFIG
+
+    # See the matching comment in `build_client`: seed the id factory
+    # before `local_session.reset()` (the next line) can draw from it.
+    seed_ids(seed)
+
+    # `local_session` is a module-level singleton shared with any prior
+    # session in this process (e.g. the one that produced `save_data`).
+    # Reset it so `create_player` below actually creates a fresh NPC
+    # instead of reusing whatever player/world/client is already
+    # attached -- otherwise restoration would trivially "work" by
+    # aliasing the old objects rather than by `load_state` doing
+    # anything.
+    local_session.reset()
+
+    # See the matching comment in `build_client`: must run AFTER
+    # `pin_clock` above, since `reset_time()` reads the clock.
+    if clock_epoch is not None:
+        local_session.reset_time()
+
+    # See the matching comment in `build_client`: set the seed directly on
+    # this build's own config copy so it is authoritative for the weather
+    # RNG, independent of whatever `tuxghost.determinism.seed_all` last
+    # left on the process-wide `CONFIG` singleton.
+    config = CONFIG.copy()
+    config.deterministic_seed = seed
+    client = headless_world(config, context)
+    _assert_fps_matches_step_rate(client)
+    random.seed(seed)
+
+    npc_state = save_data.npc_state
+    assert npc_state is not None and npc_state.current_map is not None
+
+    player = NPC.create_player(
+        local_session, slug=npc_state.player_slug or PLAYER_NPC
+    )
+    map_asset = resolve_map_asset(npc_state.current_map)
+    if map_asset is None:
+        # Unreachable from any in-repo caller: `tuxghost.execute.execute`
+        # already calls `resolve_map_asset` as a precondition BEFORE ever
+        # calling `boot_from_save`, and returns exit-2 `Refused` instead of
+        # reaching here. This branch exists for callers outside this
+        # repo's own `execute`/`verify` path -- anything that calls
+        # `boot_from_save` directly on an unchecked `save_data` -- so it
+        # still fails loudly (a real exception, not a silent bad boot)
+        # rather than letting `push_state` crash later with a less
+        # informative error.
+        raise ValueError(
+            f"save's npc_state.current_map={npc_state.current_map!r} "
+            "resolves to no map asset, with or without a .tmx extension; "
+            "callers that need a return code instead of an exception "
+            "should call resolve_map_asset() first (see tuxghost.execute)"
+        )
+    # `map_asset` (the resolved absolute path) is used ONLY as the
+    # `map_name` pushed to `WorldState` below -- `npc_state.current_map`
+    # itself is left exactly as recorded. `Entity.load_state` (via
+    # `local_session.load_state` below) restores `current_map` onto the
+    # live NPC VERBATIM from `save_data.npc_state.current_map`
+    # (`tuxemon/entity/entity.py`'s `set_current_map(save_data.current_map)`),
+    # and that value is itself digested by `tuxghost.digest.state_of()`
+    # (`EXEMPTIONS` is `{}`; nothing filters it). Canonicalizing it here
+    # (an earlier version of this function did) would make replay diverge
+    # from what a real recording actually held: a session recorded after
+    # booting from a bare, extension-less `current_map` digests that exact
+    # bare string into `header.final_digest`, so replay MUST restore that
+    # same bare string to reach the same digest -- rewriting it to a
+    # canonical basename would make a faithful replay of such a trace
+    # report `verify() == 1` ("diverged") instead of `0`, and would
+    # symmetrically make `compare`/`bisect_traces` report agreement
+    # between two saves whose recorded `current_map` genuinely differs.
+    # Both are exactly the wrong direction for this project. See task 1's
+    # fix-round-1 report for the measurement.
+    client.push_state("WorldState", session=local_session, map_name=map_asset)
+    local_session.load_state(save_data)
+
+    # `NPC.create_player` only calls `session.set_player(npc)` when `not
+    # session.has_player()` (`tuxemon/entity/npc.py`), so `player` above
+    # equals `local_session.player` only because `local_session.reset()`
+    # cleared the singleton's player earlier in this function. Assert it
+    # rather than silently trusting it: if `reset()` ever stopped doing
+    # that, the two calls below would register/unlock a NON-player NPC
+    # while the digested `local_session.player` stayed unregistered and
+    # movement-locked -- exactly the module-level-singleton hazard
+    # CLAUDE.md documents, in a form nothing else here would catch.
+    assert player is local_session.player
+
+    # See this function's docstring for WHY these two calls are needed at
+    # all, and why not via `execute_action("teleport", ...)`. The one
+    # constraint a future editor must not miss: this placement, AFTER
+    # `push_state` above, is REQUIRED, not stylistic. `push_state(
+    # "WorldState", ...)` runs `MapTransition.change_map` synchronously
+    # (`tuxemon/states/world_state.py`), which calls `NPCManager
+    # .clear_npcs()` (`tuxemon/map/transition.py`'s `_clear_npcs`) as part
+    # of loading the new map -- registering the player any earlier would
+    # be silently wiped out by that clear.
+    client.npc_manager.add_npc(player)
+    client.movement_manager.unlock_controls(player)
+
+    return client, local_session
